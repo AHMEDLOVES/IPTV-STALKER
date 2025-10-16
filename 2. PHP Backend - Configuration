@@ -40,3 +40,19 @@ class Database {
         return $this->connection;
     }
 }
+<?php
+// backend/php/config/config.php
+
+define('JWT_SECRET', getenv('JWT_SECRET') ?: 'your-secret-key-change-this');
+define('JWT_EXPIRY', 3600); // 1 hour
+define('REFRESH_TOKEN_EXPIRY', 604800); // 7 days
+define('AES_KEY', getenv('AES_KEY') ?: 'your-32-byte-encryption-key-here');
+define('MAX_SESSIONS_PER_USER', 3);
+define('STREAM_TIMEOUT', 30); // seconds
+
+// CORS settings
+define('ALLOWED_ORIGINS', ['http://localhost:3000', 'https://yourdomain.com']);
+
+// Rate limiting
+define('RATE_LIMIT_REQUESTS', 100);
+define('RATE_LIMIT_WINDOW', 60); // seconds
