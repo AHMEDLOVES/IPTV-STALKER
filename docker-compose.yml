@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: iptv_stalker
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "3306:3306"
+    networks:
+      - iptv_network
+
+  php:
+    build: ./docker/php
+    volumes:
+      - ./backend/php:/var/www/html
+    ports:
+      - "80:80"
+    depends_on:
+      - mysql
+    environment:
+      DB_HOST: mysql
+      DB_NAME: iptv_stalker
+      DB_USER: root
+      DB_PASS: rootpassword
+    networks:
+      - iptv_network
+
+  stream_server:
+    build: ./docker/python
+    command: python /app/streaming/stream_server.py
+    volumes:
+      - ./backend/python:/app
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mysql
+    environment:
+      DB_HOST: mysql
+      DB_NAME: iptv_stalker
+      DB_USER: root
+      DB_PASS: rootpassword
+    networks:
+      - iptv_network
+
+  load_balancer:
+    build: ./docker/python
+    command: python /app/load_balancer/balancer.py
+    volumes:
+      - ./backend/python:/app
+    depends_on:
+      - mysql
+    environment:
+      DB_HOST: mysql
+      DB_NAME: iptv_stalker
+      DB_USER: root
+      DB_PASS: rootpassword
+    networks:
+      - iptv_network
+
+  epg_service:
+    build: ./docker/python
+    command: python /app/epg/epg_manager.py
+    volumes:
+      - ./backend/python:/app
+    depends_on:
+      - mysql
+    environment:
+      DB_HOST: mysql
+      DB_NAME: iptv_stalker
+      DB_USER: root
+      DB_PASS: rootpassword
+    networks:
+      - iptv_network
+
+volumes:
+  mysql_data:
+
+networks:
+  iptv_network:
+    driver: bridge
