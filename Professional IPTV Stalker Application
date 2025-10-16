@@ -1,3 +1,19 @@
 I'll create a comprehensive IPTV Stalker application with both PHP and Python backends, featuring all the requirements you've specified.
 
 Project Structure
+iptv-stalker/
+├── backend/
+│   ├── php/
+│   │   ├── api/
+│   │   ├── config/
+│   │   ├── middleware/
+│   │   └── models/
+│   └── python/
+│       ├── streaming/
+│       ├── load_balancer/
+│       └── epg/
+├── frontend/
+│   ├── portal/
+│   └── assets/
+├── database/
+└── docker/
