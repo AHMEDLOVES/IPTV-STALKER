@@ -1,0 +1,314 @@
+# backend/python/load_balancer/balancer.py
+
+import asyncio
+import aiohttp
+from typing import List, Dict, Optional
+import mysql.connector
+from mysql.connector import pooling
+import logging
+from datetime import datetime, timedelta
+import hashlib
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class LoadBalancer:
+    def __init__(self, config):
+        self.config = config
+        self.db_pool = mysql.connector.pooling.MySQLConnectionPool(
+            pool_name="lb_pool",
+            pool_size=10,
+            host=config['db_host'],
+            database=config['db_name'],
+            user=config['db_user'],
+            password=config['db_password']
+        )
+        self.health_check_interval = config.get('health_check_interval', 30)
+        self.server_weights = {}
+    
+    async def get_optimal_server(self, user_location: str = None) -> Optional[Dict]:
+        """Get the optimal server based on load and location"""
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        try:
+            query = """
+                SELECT * FROM servers
+                WHERE is_active = 1
+                AND current_load < max_capacity
+                ORDER BY 
+                    (current_load / max_capacity) ASC,
+                    priority DESC
+                LIMIT 5
+            """
+            cursor.execute(query)
+            servers = cursor.fetchall()
+            
+            if not servers:
+                return None
+            
+            # If user location is provided, prefer servers in the same region
+            if user_location:
+                regional_servers = [s for s in servers if s['region'] == user_location]
+                if regional_servers:
+                    servers = regional_servers
+            
+            # Calculate scores based on multiple factors
+            server_scores = []
+            for server in servers:
+                score = await self._calculate_server_score(server)
+                server_scores.append((server, score))
+            
+            # Sort by score (higher is better)
+            server_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            return server_scores[0][0] if server_scores else None
+            
+        finally:
+            cursor.close()
+            connection.close()
+    
+    async def _calculate_server_score(self, server: Dict) -> float:
+        """Calculate server score based on multiple factors"""
+        # Load factor (0-1, lower is better)
+        load_factor = 1 - (server['current_load'] / server['max_capacity'])
+        
+        # Priority factor (normalized)
+        priority_factor = server['priority'] / 10.0
+        
+        # Health factor (from health checks)
+        health_factor = self.server_weights.get(server['id'], {}).get('health', 1.0)
+        
+        # Response time factor
+        response_factor = self.server_weights.get(server['id'], {}).get('response_time', 1.0)
+        
+        # Combined score (weighted average)
+        score = (
+            load_factor * 0.4 +
+            priority_factor * 0.2 +
+            health_factor * 0.2 +
+            response_factor * 0.2
+        )
+        
+        return score
+    
+    async def health_check(self):
+        """Perform health checks on all servers"""
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        try:
+            cursor.execute("SELECT * FROM servers WHERE is_active = 1")
+            servers = cursor.fetchall()
+            
+            tasks = [self._check_server_health(server) for server in servers]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for server, result in zip(servers, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Health check failed for {server['name']}: {str(result)}")
+                    self._update_server_status(server['id'], False)
+                else:
+                    self.server_weights[server['id']] = result
+                    
+        finally:
+            cursor.close()
+            connection.close()
+    
+    async def _check_server_health(self, server: Dict) -> Dict:
+        """Check health of a single server"""
+        url = f"http://{server['host']}:{server['port']}/health"
+        
+        try:
+            start_time = datetime.now()
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    status = response.status
+                    
+            end_time = datetime.now()
+            response_time = (end_time - start_time).total_seconds()
+            
+            # Calculate health score
+            health_score = 1.0 if status == 200 else 0.0
+            
+            # Calculate response time score (1.0 for <100ms, decreasing to 0.1 for >1s)
+            response_score = max(0.1, 1.0 - (response_time / 1.0))
+            
+            return {
+                'health': health_score,
+                'response_time': response_score,
+                'last_check': datetime.now()
+            }
+            
+        except Exception as e:
+            logger.warning(f"Server {server['name']} health check failed: {str(e)}")
+            return {
+                'health': 0.0,
+                'response_time': 0.0,
+                'last_check': datetime.now()
+            }
+    
+    def _update_server_status(self, server_id: int, is_active: bool):
+        """Update server active status"""
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor()
+        
+        try:
+            cursor.execute(
+                "UPDATE servers SET is_active = %s WHERE id = %s",
+                (is_active, server_id)
+            )
+            connection.commit()
+            
+        finally:
+            cursor.close()
+            connection.close()
+    
+    async def rebalance_load(self):
+        """Rebalance load across servers"""
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        try:
+            # Get overloaded servers (>80% capacity)
+            cursor.execute("""
+                SELECT * FROM servers
+                WHERE is_active = 1
+                AND (current_load / max_capacity) > 0.8
+            """)
+            overloaded = cursor.fetchall()
+            
+            if not overloaded:
+                return
+            
+            logger.info(f"Found {len(overloaded)} overloaded servers")
+            
+            for server in overloaded:
+                # Get active sessions on this server
+                cursor.execute("""
+                    SELECT * FROM active_sessions
+                    WHERE server_id = %s
+                    ORDER BY last_activity ASC
+                    LIMIT 10
+                """, (server['id'],))
+                sessions = cursor.fetchall()
+                
+                for session in sessions:
+                    # Find alternative server
+                    new_server = await self.get_optimal_server()
+                    
+                    if new_server and new_server['id'] != server['id']:
+                        # Migrate session
+                        self._migrate_session(session, new_server['id'])
+                        
+        finally:
+            cursor.close()
+            connection.close()
+    
+    def _migrate_session(self, session: Dict, new_server_id: int):
+        """Migrate a session to a different server"""
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor()
+        
+        try:
+            old_server_id = session['server_id']
+            
+            # Update session
+            cursor.execute("""
+                UPDATE active_sessions
+                SET server_id = %s
+                WHERE id = %s
+            """, (new_server_id, session['id']))
+            
+            # Update server loads
+            cursor.execute("""
+                UPDATE servers
+                SET current_load = GREATEST(current_load - 1, 0)
+                WHERE id = %s
+            """, (old_server_id,))
+            
+            cursor.execute("""
+                UPDATE servers
+                SET current_load = current_load + 1
+                WHERE id = %s
+            """, (new_server_id,))
+            
+            connection.commit()
+            logger.info(f"Migrated session {session['id']} from server {old_server_id} to {new_server_id}")
+            
+        finally:
+            cursor.close()
+            connection.close()
+    
+    async def start_monitoring(self):
+        """Start continuous monitoring"""
+        logger.info("Starting load balancer monitoring")
+        
+        while True:
+            try:
+                # Health checks
+                await self.health_check()
+                
+                # Rebalance if needed
+                await self.rebalance_load()
+                
+                # Clean up stale sessions
+                self._cleanup_stale_sessions()
+                
+            except Exception as e:
+                logger.error(f"Monitoring error: {str(e)}")
+            
+            await asyncio.sleep(self.health_check_interval)
+    
+    def _cleanup_stale_sessions(self):
+        """Remove stale sessions (inactive > 5 minutes)"""
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        try:
+            # Get stale sessions
+            cursor.execute("""
+                SELECT * FROM active_sessions
+                WHERE last_activity < DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+            """)
+            stale_sessions = cursor.fetchall()
+            
+            for session in stale_sessions:
+                # Update server load
+                cursor.execute("""
+                    UPDATE servers
+                    SET current_load = GREATEST(current_load - 1, 0)
+                    WHERE id = %s
+                """, (session['server_id'],))
+                
+                # Delete session
+                cursor.execute(
+                    "DELETE FROM active_sessions WHERE id = %s",
+                    (session['id'],)
+                )
+            
+            connection.commit()
+            
+            if stale_sessions:
+                logger.info(f"Cleaned up {len(stale_sessions)} stale sessions")
+                
+        finally:
+            cursor.close()
+            connection.close()
+
+
+# Run load balancer
+if __name__ == '__main__':
+    config = {
+        'db_host': 'localhost',
+        'db_name': 'iptv_stalker',
+        'db_user': 'root',
+        'db_password': '',
+        'health_check_interval': 30
+    }
+    
+    balancer = LoadBalancer(config)
+    
+    # Start monitoring
+    asyncio.run(balancer.start_monitoring())
