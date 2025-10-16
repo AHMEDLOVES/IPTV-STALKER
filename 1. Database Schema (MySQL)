@@ -1,0 +1,119 @@
+-- database/schema.sql
+
+CREATE DATABASE iptv_stalker CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE iptv_stalker;
+
+-- Users table
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    mac_address VARCHAR(17) UNIQUE,
+    subscription_end DATETIME,
+    is_active BOOLEAN DEFAULT TRUE,
+    max_connections INT DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_mac (mac_address),
+    INDEX idx_active (is_active)
+) ENGINE=InnoDB;
+
+-- Servers table
+CREATE TABLE servers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    host VARCHAR(255) NOT NULL,
+    port INT NOT NULL,
+    protocol ENUM('HLS', 'RTMP', 'RTSP') DEFAULT 'HLS',
+    max_capacity INT DEFAULT 1000,
+    current_load INT DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    region VARCHAR(50),
+    priority INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_load (current_load, is_active)
+) ENGINE=InnoDB;
+
+-- Channels table
+CREATE TABLE channels (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    stream_url TEXT NOT NULL,
+    logo_url VARCHAR(255),
+    category_id INT,
+    epg_id VARCHAR(100),
+    is_active BOOLEAN DEFAULT TRUE,
+    sort_order INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_category (category_id),
+    INDEX idx_epg (epg_id)
+) ENGINE=InnoDB;
+
+-- Categories table
+CREATE TABLE categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    parent_id INT NULL,
+    sort_order INT DEFAULT 0,
+    FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- EPG data table
+CREATE TABLE epg_programs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    channel_id INT NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    start_time DATETIME NOT NULL,
+    end_time DATETIME NOT NULL,
+    icon_url VARCHAR(255),
+    rating VARCHAR(10),
+    FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    INDEX idx_channel_time (channel_id, start_time, end_time)
+) ENGINE=InnoDB;
+
+-- Active sessions table
+CREATE TABLE active_sessions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    channel_id INT NOT NULL,
+    server_id INT NOT NULL,
+    session_token VARCHAR(255) UNIQUE NOT NULL,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE,
+    INDEX idx_user (user_id),
+    INDEX idx_token (session_token)
+) ENGINE=InnoDB;
+
+-- Stream statistics
+CREATE TABLE stream_stats (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    channel_id INT NOT NULL,
+    server_id INT NOT NULL,
+    duration_seconds INT DEFAULT 0,
+    bytes_transferred BIGINT DEFAULT 0,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_user_stats (user_id, started_at)
+) ENGINE=InnoDB;
+
+-- Authentication tokens
+CREATE TABLE auth_tokens (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    token VARCHAR(255) UNIQUE NOT NULL,
+    refresh_token VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_token (token),
+    INDEX idx_refresh (refresh_token)
+) ENGINE=InnoDB;
