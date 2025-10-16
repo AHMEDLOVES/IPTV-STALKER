@@ -1,0 +1,262 @@
+# backend/python/streaming/stream_server.py
+
+from aiohttp import web
+import aiohttp
+import asyncio
+import hashlib
+import hmac
+from urllib.parse import urlparse, parse_qs
+import mysql.connector
+from datetime import datetime
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class StreamServer:
+    def __init__(self, config):
+        self.config = config
+        self.aes_key = config['aes_key']
+        self.db_config = {
+            'host': config['db_host'],
+            'database': config['db_name'],
+            'user': config['db_user'],
+            'password': config['db_password']
+        }
+    
+    def get_db_connection(self):
+        return mysql.connector.connect(**self.db_config)
+    
+    async def handle_stream(self, request):
+        """Handle stream requests"""
+        try:
+            # Validate request
+            validation = await self._validate_request(request)
+            if not validation['valid']:
+                return web.Response(status=401, text=validation['error'])
+            
+            # Get source stream URL
+            source_url = request.query.get('url')
+            if not source_url:
+                return web.Response(status=400, text='Missing stream URL')
+            
+            # Update session activity
+            await self._update_session_activity(validation['session_token'])
+            
+            # Proxy the stream
+            return await self._proxy_stream(source_url, request)
+            
+        except Exception as e:
+            logger.error(f"Stream error: {str(e)}")
+            return web.Response(status=500, text='Stream error')
+    
+    async def _validate_request(self, request):
+        """Validate stream request"""
+        token = request.query.get('token')
+        expires = request.query.get('expires')
+        signature = request.query.get('signature')
+        
+        if not all([token, expires, signature]):
+            return {'valid': False, 'error': 'Missing parameters'}
+        
+        # Check expiry
+        if int(expires) < datetime.now().timestamp():
+            return {'valid': False, 'error': 'Token expired'}
+        
+        # Verify session exists
+        connection = self.get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        try:
+            cursor.execute(
+                "SELECT user_id FROM active_sessions WHERE session_token = %s",
+                (token,)
+            )
+            session = cursor.fetchone()
+            
+            if not session:
+                return {'valid': False, 'error': 'Invalid session'}
+            
+            # Verify signature
+            data = f"{session['user_id']}:{token}:{expires}"
+            expected_sig = hmac.new(
+                self.aes_key.encode(),
+                data.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            if not hmac.compare_digest(signature, expected_sig):
+                return {'valid': False, 'error': 'Invalid signature'}
+            
+            return {
+                'valid': True,
+                'user_id': session['user_id'],
+                'session_token': token
+            }
+            
+        finally:
+            cursor.close()
+            connection.close()
+    
+    async def _proxy_stream(self, source_url, request):
+        """Proxy the video stream"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(source_url, timeout=None) as resp:
+                    # Get content type
+                    content_type = resp.headers.get('Content-Type', 'application/octet-stream')
+                    
+                    # Create response
+                    response = web.StreamResponse(
+                        status=resp.status,
+                        headers={
+                            'Content-Type': content_type,
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive'
+                        }
+                    )
+                    
+                    # Support range requests
+                    if 'Range' in request.headers:
+                        response.headers['Accept-Ranges'] = 'bytes'
+                    
+                    await response.prepare(request)
+                    
+                    # Stream data
+                    bytes_sent = 0
+                    async for chunk in resp.content.iter_chunked(8192):
+                        await response.write(chunk)
+                        bytes_sent += len(chunk)
+                    
+                    # Update statistics
+                    await self._update_statistics(
+                        request.query.get('token'),
+                        bytes_sent
+                    )
+                    
+                    await response.write_eof()
+                    return response
+                    
+        except Exception as e:
+            logger.error(f"Proxy error: {str(e)}")
+            raise
+    
+    async def _update_session_activity(self, session_token):
+        """Update session last activity"""
+        connection = self.get_db_connection()
+        cursor = connection.cursor()
+        
+        try:
+            cursor.execute(
+                "UPDATE active_sessions SET last_activity = NOW() WHERE session_token = %s",
+                (session_token,)
+            )
+            connection.commit()
+        finally:
+            cursor.close()
+            connection.close()
+    
+    async def _update_statistics(self, session_token, bytes_transferred):
+        """Update stream statistics"""
+        connection = self.get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        try:
+            # Get session info
+            cursor.execute(
+                "SELECT user_id, channel_id FROM active_sessions WHERE session_token = %s",
+                (session_token,)
+            )
+            session = cursor.fetchone()
+            
+            if session:
+                cursor.execute("""
+                    UPDATE stream_stats
+                    SET bytes_transferred = bytes_transferred + %s
+                    WHERE user_id = %s AND channel_id = %s AND ended_at IS NULL
+                """, (bytes_transferred, session['user_id'], session['channel_id']))
+                connection.commit()
+                
+        finally:
+            cursor.close()
+            connection.close()
+    
+    async def handle_health(self, request):
+        """Health check endpoint"""
+        return web.json_response({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+    
+    async def handle_hls_manifest(self, request):
+        """Handle HLS manifest (.m3u8) files"""
+        try:
+            validation = await self._validate_request(request)
+            if not validation['valid']:
+                return web.Response(status=401, text=validation['error'])
+            
+            source_url = request.query.get('url')
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(source_url) as resp:
+                    manifest = await resp.text()
+                    
+                    # Rewrite URLs in manifest to proxy through our server
+                    modified_manifest = self._rewrite_manifest_urls(
+                        manifest,
+                        source_url,
+                        validation['session_token']
+                    )
+                    
+                    return web.Response(
+                        text=modified_manifest,
+                        content_type='application/vnd.apple.mpegurl'
+                    )
+                    
+        except Exception as e:
+            logger.error(f"Manifest error: {str(e)}")
+            return web.Response(status=500, text='Manifest error')
+    
+    def _rewrite_manifest_urls(self, manifest, base_url, session_token):
+        """Rewrite URLs in HLS manifest"""
+        lines = manifest.split('\n')
+        base_path = '/'.join(base_url.split('/')[:-1])
+        
+        rewritten = []
+        for line in lines:
+            if line.startswith('#') or not line.strip():
+                rewritten.append(line)
+            else:
+                # Rewrite segment URLs
+                if not line.startswith('http'):
+                    segment_url = f"{base_path}/{line}"
+                else:
+                    segment_url = line
+                
+                proxied_url = f"/stream?token={session_token}&url={segment_url}"
+                rewritten.append(proxied_url)
+        
+        return '\n'.join(rewritten)
+    
+    def create_app(self):
+        """Create aiohttp application"""
+        app = web.Application()
+        app.router.add_get('/stream', self.handle_stream)
+        app.router.add_get('/manifest.m3u8', self.handle_hls_manifest)
+        app.router.add_get('/health', self.handle_health)
+        return app
+
+
+# Run streaming server
+if __name__ == '__main__':
+    config = {
+        'host': '0.0.0.0',
+        'port': 8080,
+        'db_host': 'localhost',
+        'db_name': 'iptv_stalker',
+        'db_user': 'root',
+        'db_password': '',
+        'aes_key': 'your-32-byte-encryption-key-here'
+    }
+    
+    server = StreamServer(config)
+    app = server.create_app()
+    
+    web.run_app(app, host=config['host'], port=config['port'])
