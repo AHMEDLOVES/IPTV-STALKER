@@ -1,0 +1,282 @@
+# backend/python/epg/epg_manager.py
+
+import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+import mysql.connector
+from mysql.connector import pooling
+import logging
+import gzip
+import io
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class EPGManager:
+    def __init__(self, config):
+        self.config = config
+        self.db_pool = mysql.connector.pooling.MySQLConnectionPool(
+            pool_name="epg_pool",
+            pool_size=5,
+            host=config['db_host'],
+            database=config['db_name'],
+            user=config['db_user'],
+            password=config['db_password']
+        )
+    
+    def fetch_epg(self, epg_url):
+        """Fetch and parse XMLTV EPG data"""
+        try:
+            logger.info(f"Fetching EPG from {epg_url}")
+            response = requests.get(epg_url, timeout=30, stream=True)
+            response.raise_for_status()
+            
+            # Handle gzipped content
+            if epg_url.endswith('.gz'):
+                content = gzip.decompress(response.content)
+            else:
+                content = response.content
+            
+            return self.parse_xmltv(content)
+            
+        except Exception as e:
+            logger.error(f"Error fetching EPG: {str(e)}")
+            return None
+    
+    def parse_xmltv(self, xml_content):
+        """Parse XMLTV format EPG data"""
+        try:
+            root = ET.fromstring(xml_content)
+            
+            channels = {}
+            programmes = []
+            
+            # Parse channels
+            for channel in root.findall('channel'):
+                channel_id = channel.get('id')
+                display_name = channel.find('display-name')
+                
+                if display_name is not None:
+                    channels[channel_id] = {
+                        'id': channel_id,
+                        'name': display_name.text,
+                        'icon': self._get_icon(channel)
+                    }
+            
+            # Parse programmes
+            for programme in root.findall('programme'):
+                try:
+                    prog_data = {
+                        'channel_id': programme.get('channel'),
+                        'start': self._parse_time(programme.get('start')),
+                        'stop': self._parse_time(programme.get('stop')),
+                        'title': self._get_text(programme, 'title'),
+                        'description': self._get_text(programme, 'desc'),
+                        'icon': self._get_icon(programme),
+                        'rating': self._get_rating(programme)
+                    }
+                    
+                    if prog_data['start'] and prog_data['stop']:
+                        programmes.append(prog_data)
+                        
+                except Exception as e:
+                    logger.warning(f"Error parsing programme: {str(e)}")
+                    continue
+            
+            return {
+                'channels': channels,
+                'programmes': programmes
+            }
+            
+        except Exception as e:
+            logger.error(f"Error parsing XMLTV: {str(e)}")
+            return None
+    
+    def update_database(self, epg_data):
+        """Update database with EPG data"""
+        if not epg_data:
+            return False
+        
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor()
+        
+        try:
+            # Map EPG channel IDs to internal channel IDs
+            cursor.execute("SELECT id, epg_id FROM channels WHERE epg_id IS NOT NULL")
+            channel_mapping = {row[1]: row[0] for row in cursor.fetchall()}
+            
+            # Clear old EPG data (older than 1 day ago)
+            cutoff_date = datetime.now() - timedelta(days=1)
+            cursor.execute(
+                "DELETE FROM epg_programs WHERE end_time < %s",
+                (cutoff_date,)
+            )
+            
+            # Insert new programmes
+            insert_query = """
+                INSERT INTO epg_programs 
+                (channel_id, title, description, start_time, end_time, icon_url, rating)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                title = VALUES(title),
+                description = VALUES(description),
+                icon_url = VALUES(icon_url),
+                rating = VALUES(rating)
+            """
+            
+            batch_size = 1000
+            programmes = []
+            
+            for prog in epg_data['programmes']:
+                internal_channel_id = channel_mapping.get(prog['channel_id'])
+                if not internal_channel_id:
+                    continue
+                
+                programmes.append((
+                    internal_channel_id,
+                    prog['title'],
+                    prog['description'],
+                    prog['start'],
+                    prog['stop'],
+                    prog['icon'],
+                    prog['rating']
+                ))
+                
+                if len(programmes) >= batch_size:
+                    cursor.executemany(insert_query, programmes)
+                    connection.commit()
+                    programmes = []
+            
+            # Insert remaining programmes
+            if programmes:
+                cursor.executemany(insert_query, programmes)
+                connection.commit()
+            
+            logger.info(f"Updated {len(epg_data['programmes'])} EPG programmes")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating database: {str(e)}")
+            connection.rollback()
+            return False
+            
+        finally:
+            cursor.close()
+            connection.close()
+    
+    def get_current_programme(self, channel_id):
+        """Get currently playing programme for a channel"""
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        try:
+            query = """
+                SELECT * FROM epg_programs
+                WHERE channel_id = %s
+                AND start_time <= NOW()
+                AND end_time >= NOW()
+                LIMIT 1
+            """
+            cursor.execute(query, (channel_id,))
+            return cursor.fetchone()
+            
+        finally:
+            cursor.close()
+            connection.close()
+    
+    def get_schedule(self, channel_id, start_date=None, end_date=None):
+        """Get programme schedule for a channel"""
+        if not start_date:
+            start_date = datetime.now()
+        if not end_date:
+            end_date = start_date + timedelta(days=1)
+        
+        connection = self.db_pool.get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        try:
+            query = """
+                SELECT * FROM epg_programs
+                WHERE channel_id = %s
+                AND start_time >= %s
+                AND start_time < %s
+                ORDER BY start_time
+            """
+            cursor.execute(query, (channel_id, start_date, end_date))
+            return cursor.fetchall()
+            
+        finally:
+            cursor.close()
+            connection.close()
+    
+    @staticmethod
+    def _parse_time(time_str):
+        """Parse XMLTV time format: YYYYMMDDHHmmss +HHMM"""
+        if not time_str:
+            return None
+        
+        try:
+            # Remove timezone offset for simplicity
+            time_str = time_str.split()[0]
+            return datetime.strptime(time_str, '%Y%m%d%H%M%S')
+        except:
+            return None
+    
+    @staticmethod
+    def _get_text(element, tag):
+        """Get text content of an XML element"""
+        child = element.find(tag)
+        return child.text if child is not None else None
+    
+    @staticmethod
+    def _get_icon(element):
+        """Get icon URL from element"""
+        icon = element.find('icon')
+        return icon.get('src') if icon is not None else None
+    
+    @staticmethod
+    def _get_rating(element):
+        """Get rating from element"""
+        rating = element.find('rating')
+        if rating is not None:
+            value = rating.find('value')
+            return value.text if value is not None else None
+        return None
+
+
+# EPG update service
+if __name__ == '__main__':
+    import schedule
+    import time
+    
+    config = {
+        'db_host': 'localhost',
+        'db_name': 'iptv_stalker',
+        'db_user': 'root',
+        'db_password': '',
+        'epg_urls': [
+            'http://example.com/epg.xml.gz',
+            # Add more EPG sources
+        ]
+    }
+    
+    epg_manager = EPGManager(config)
+    
+    def update_epg():
+        logger.info("Starting EPG update")
+        for url in config['epg_urls']:
+            epg_data = epg_manager.fetch_epg(url)
+            if epg_data:
+                epg_manager.update_database(epg_data)
+        logger.info("EPG update completed")
+    
+    # Update EPG every 6 hours
+    schedule.every(6).hours.do(update_epg)
+    
+    # Initial update
+    update_epg()
+    
+    # Keep running
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
