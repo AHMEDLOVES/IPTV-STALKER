@@ -1,0 +1,303 @@
+<?php
+// backend/php/api/auth.php
+
+require_once '../config/database.php';
+require_once '../config/config.php';
+require_once '../middleware/jwt.php';
+
+class AuthController {
+    private $db;
+    private $jwt;
+    
+    public function __construct() {
+        $this->db = Database::getInstance()->getConnection();
+        $this->jwt = new JWTHandler();
+    }
+    
+    public function register($data) {
+        try {
+            // Validate input
+            if (!$this->validateRegistration($data)) {
+                return ['success' => false, 'error' => 'Invalid input data'];
+            }
+            
+            // Check if user exists
+            $stmt = $this->db->prepare(
+                "SELECT id FROM users WHERE username = ? OR email = ? OR mac_address = ?"
+            );
+            $stmt->execute([$data['username'], $data['email'], $data['mac_address']]);
+            
+            if ($stmt->fetch()) {
+                return ['success' => false, 'error' => 'User already exists'];
+            }
+            
+            // Hash password
+            $passwordHash = password_hash($data['password'], PASSWORD_ARGON2ID);
+            
+            // Insert user
+            $stmt = $this->db->prepare(
+                "INSERT INTO users (username, email, password_hash, mac_address, subscription_end) 
+                 VALUES (?, ?, ?, ?, ?)"
+            );
+            
+            $subscriptionEnd = date('Y-m-d H:i:s', strtotime('+30 days'));
+            $stmt->execute([
+                $data['username'],
+                $data['email'],
+                $passwordHash,
+                $data['mac_address'],
+                $subscriptionEnd
+            ]);
+            
+            $userId = $this->db->lastInsertId();
+            
+            // Generate tokens
+            $tokens = $this->jwt->generateTokens($userId);
+            $this->storeTokens($userId, $tokens);
+            
+            return [
+                'success' => true,
+                'user_id' => $userId,
+                'token' => $tokens['access_token'],
+                'refresh_token' => $tokens['refresh_token']
+            ];
+            
+        } catch (Exception $e) {
+            error_log("Registration error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Registration failed'];
+        }
+    }
+    
+    public function login($data) {
+        try {
+            // Find user
+            $stmt = $this->db->prepare(
+                "SELECT id, username, password_hash, is_active, subscription_end 
+                 FROM users WHERE username = ? OR email = ? OR mac_address = ?"
+            );
+            
+            $identifier = $data['username'] ?? $data['mac_address'] ?? '';
+            $stmt->execute([$identifier, $identifier, $identifier]);
+            $user = $stmt->fetch();
+            
+            if (!$user) {
+                return ['success' => false, 'error' => 'Invalid credentials'];
+            }
+            
+            // Verify password (if provided)
+            if (isset($data['password'])) {
+                if (!password_verify($data['password'], $user['password_hash'])) {
+                    return ['success' => false, 'error' => 'Invalid credentials'];
+                }
+            }
+            
+            // Check if account is active
+            if (!$user['is_active']) {
+                return ['success' => false, 'error' => 'Account is disabled'];
+            }
+            
+            // Check subscription
+            if (strtotime($user['subscription_end']) < time()) {
+                return ['success' => false, 'error' => 'Subscription expired'];
+            }
+            
+            // Check concurrent sessions
+            if (!$this->checkConcurrentSessions($user['id'])) {
+                return ['success' => false, 'error' => 'Maximum connections reached'];
+            }
+            
+            // Generate tokens
+            $tokens = $this->jwt->generateTokens($user['id']);
+            $this->storeTokens($user['id'], $tokens);
+            
+            // Update last activity
+            $stmt = $this->db->prepare("UPDATE users SET updated_at = NOW() WHERE id = ?");
+            $stmt->execute([$user['id']]);
+            
+            return [
+                'success' => true,
+                'user_id' => $user['id'],
+                'username' => $user['username'],
+                'token' => $tokens['access_token'],
+                'refresh_token' => $tokens['refresh_token'],
+                'subscription_end' => $user['subscription_end']
+            ];
+            
+        } catch (Exception $e) {
+            error_log("Login error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Login failed'];
+        }
+    }
+    
+    public function refreshToken($refreshToken) {
+        try {
+            // Verify refresh token
+            $stmt = $this->db->prepare(
+                "SELECT user_id, expires_at FROM auth_tokens WHERE refresh_token = ?"
+            );
+            $stmt->execute([$refreshToken]);
+            $tokenData = $stmt->fetch();
+            
+            if (!$tokenData || strtotime($tokenData['expires_at']) < time()) {
+                return ['success' => false, 'error' => 'Invalid or expired refresh token'];
+            }
+            
+            // Generate new tokens
+            $tokens = $this->jwt->generateTokens($tokenData['user_id']);
+            
+            // Delete old tokens and store new ones
+            $this->db->prepare("DELETE FROM auth_tokens WHERE refresh_token = ?")
+                     ->execute([$refreshToken]);
+            $this->storeTokens($tokenData['user_id'], $tokens);
+            
+            return [
+                'success' => true,
+                'token' => $tokens['access_token'],
+                'refresh_token' => $tokens['refresh_token']
+            ];
+            
+        } catch (Exception $e) {
+            error_log("Token refresh error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Token refresh failed'];
+        }
+    }
+    
+    private function validateRegistration($data) {
+        $required = ['username', 'email', 'password', 'mac_address'];
+        foreach ($required as $field) {
+            if (!isset($data[$field]) || empty($data[$field])) {
+                return false;
+            }
+        }
+        
+        // Validate email
+        if (!filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+        
+        // Validate MAC address format
+        if (!preg_match('/^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/', $data['mac_address'])) {
+            return false;
+        }
+        
+        // Validate password strength
+        if (strlen($data['password']) < 8) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    private function checkConcurrentSessions($userId) {
+        $stmt = $this->db->prepare(
+            "SELECT COUNT(*) as count FROM active_sessions 
+             WHERE user_id = ? AND last_activity > DATE_SUB(NOW(), INTERVAL 5 MINUTE)"
+        );
+        $stmt->execute([$userId]);
+        $result = $stmt->fetch();
+        
+        $stmt2 = $this->db->prepare("SELECT max_connections FROM users WHERE id = ?");
+        $stmt2->execute([$userId]);
+        $user = $stmt2->fetch();
+        
+        return $result['count'] < $user['max_connections'];
+    }
+    
+    private function storeTokens($userId, $tokens) {
+        $stmt = $this->db->prepare(
+            "INSERT INTO auth_tokens (user_id, token, refresh_token, expires_at) 
+             VALUES (?, ?, ?, ?)"
+        );
+        
+        $expiresAt = date('Y-m-d H:i:s', time() + REFRESH_TOKEN_EXPIRY);
+        $stmt->execute([
+            $userId,
+            $tokens['access_token'],
+            $tokens['refresh_token'],
+            $expiresAt
+        ]);
+        
+        // Clean old tokens
+        $this->db->prepare(
+            "DELETE FROM auth_tokens WHERE user_id = ? AND expires_at < NOW()"
+        )->execute([$userId]);
+    }
+}
+
+<?php
+// backend/php/middleware/jwt.php
+
+require_once __DIR__ . '/../vendor/autoload.php';
+use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
+
+class JWTHandler {
+    private $secret;
+    
+    public function __construct() {
+        $this->secret = JWT_SECRET;
+    }
+    
+    public function generateTokens($userId) {
+        $issuedAt = time();
+        
+        // Access token
+        $accessPayload = [
+            'iat' => $issuedAt,
+            'exp' => $issuedAt + JWT_EXPIRY,
+            'user_id' => $userId,
+            'type' => 'access'
+        ];
+        
+        // Refresh token
+        $refreshPayload = [
+            'iat' => $issuedAt,
+            'exp' => $issuedAt + REFRESH_TOKEN_EXPIRY,
+            'user_id' => $userId,
+            'type' => 'refresh',
+            'jti' => bin2hex(random_bytes(16))
+        ];
+        
+        return [
+            'access_token' => JWT::encode($accessPayload, $this->secret, 'HS256'),
+            'refresh_token' => JWT::encode($refreshPayload, $this->secret, 'HS256')
+        ];
+    }
+    
+    public function validateToken($token) {
+        try {
+            $decoded = JWT::decode($token, new Key($this->secret, 'HS256'));
+            return [
+                'valid' => true,
+                'user_id' => $decoded->user_id,
+                'type' => $decoded->type
+            ];
+        } catch (Exception $e) {
+            return ['valid' => false, 'error' => $e->getMessage()];
+        }
+    }
+}
+
+// Middleware function
+function requireAuth() {
+    $headers = getallheaders();
+    $authHeader = $headers['Authorization'] ?? '';
+    
+    if (!preg_match('/Bearer\s+(.*)$/i', $authHeader, $matches)) {
+        http_response_code(401);
+        echo json_encode(['error' => 'No token provided']);
+        exit;
+    }
+    
+    $token = $matches[1];
+    $jwt = new JWTHandler();
+    $validation = $jwt->validateToken($token);
+    
+    if (!$validation['valid']) {
+        http_response_code(401);
+        echo json_encode(['error' => 'Invalid token']);
+        exit;
+    }
+    
+    return $validation['user_id'];
+}
