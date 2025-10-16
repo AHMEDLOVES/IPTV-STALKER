@@ -1,0 +1,199 @@
+<?php
+// backend/php/api/channels.php
+
+require_once '../config/database.php';
+require_once '../middleware/jwt.php';
+
+class ChannelController {
+    private $db;
+    
+    public function __construct() {
+        $this->db = Database::getInstance()->getConnection();
+    }
+    
+    public function getChannels($userId, $categoryId = null) {
+        try {
+            $query = "SELECT c.*, cat.name as category_name 
+                      FROM channels c 
+                      LEFT JOIN categories cat ON c.category_id = cat.id 
+                      WHERE c.is_active = 1";
+            
+            $params = [];
+            if ($categoryId) {
+                $query .= " AND c.category_id = ?";
+                $params[] = $categoryId;
+            }
+            
+            $query .= " ORDER BY c.sort_order, c.name";
+            
+            $stmt = $this->db->prepare($query);
+            $stmt->execute($params);
+            
+            return [
+                'success' => true,
+                'channels' => $stmt->fetchAll()
+            ];
+            
+        } catch (Exception $e) {
+            error_log("Get channels error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Failed to fetch channels'];
+        }
+    }
+    
+    public function getCategories() {
+        try {
+            $stmt = $this->db->prepare(
+                "SELECT * FROM categories ORDER BY sort_order, name"
+            );
+            $stmt->execute();
+            
+            return [
+                'success' => true,
+                'categories' => $stmt->fetchAll()
+            ];
+            
+        } catch (Exception $e) {
+            error_log("Get categories error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Failed to fetch categories'];
+        }
+    }
+    
+    public function getStreamUrl($userId, $channelId) {
+        try {
+            // Verify channel exists
+            $stmt = $this->db->prepare(
+                "SELECT id, stream_url FROM channels WHERE id = ? AND is_active = 1"
+            );
+            $stmt->execute([$channelId]);
+            $channel = $stmt->fetch();
+            
+            if (!$channel) {
+                return ['success' => false, 'error' => 'Channel not found'];
+            }
+            
+            // Get optimal server
+            $server = $this->getOptimalServer();
+            if (!$server) {
+                return ['success' => false, 'error' => 'No server available'];
+            }
+            
+            // Create session
+            $sessionToken = bin2hex(random_bytes(32));
+            $stmt = $this->db->prepare(
+                "INSERT INTO active_sessions (user_id, channel_id, server_id, session_token, ip_address, user_agent) 
+                 VALUES (?, ?, ?, ?, ?, ?)"
+            );
+            
+            $stmt->execute([
+                $userId,
+                $channelId,
+                $server['id'],
+                $sessionToken,
+                $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+                $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
+            ]);
+            
+            // Update server load
+            $this->db->prepare(
+                "UPDATE servers SET current_load = current_load + 1 WHERE id = ?"
+            )->execute([$server['id']]);
+            
+            // Generate encrypted stream URL
+            $streamUrl = $this->generateSecureStreamUrl(
+                $server,
+                $channel['stream_url'],
+                $sessionToken,
+                $userId
+            );
+            
+            // Start statistics tracking
+            $this->db->prepare(
+                "INSERT INTO stream_stats (user_id, channel_id, server_id) 
+                 VALUES (?, ?, ?)"
+            )->execute([$userId, $channelId, $server['id']]);
+            
+            return [
+                'success' => true,
+                'stream_url' => $streamUrl,
+                'session_token' => $sessionToken,
+                'server' => $server['name']
+            ];
+            
+        } catch (Exception $e) {
+            error_log("Get stream URL error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Failed to get stream URL'];
+        }
+    }
+    
+    private function getOptimalServer() {
+        // Get server with lowest load and highest priority
+        $stmt = $this->db->prepare(
+            "SELECT * FROM servers 
+             WHERE is_active = 1 AND current_load < max_capacity 
+             ORDER BY (current_load / max_capacity), priority DESC 
+             LIMIT 1"
+        );
+        $stmt->execute();
+        return $stmt->fetch();
+    }
+    
+    private function generateSecureStreamUrl($server, $channelUrl, $sessionToken, $userId) {
+        $timestamp = time();
+        $expiry = $timestamp + STREAM_TIMEOUT;
+        
+        // Create signature
+        $data = "$userId:$sessionToken:$expiry";
+        $signature = hash_hmac('sha256', $data, AES_KEY);
+        
+        // Build URL with query parameters
+        $params = http_build_query([
+            'token' => $sessionToken,
+            'expires' => $expiry,
+            'signature' => $signature
+        ]);
+        
+        $protocol = $server['protocol'];
+        $baseUrl = "{$protocol}://{$server['host']}:{$server['port']}";
+        
+        return "$baseUrl/stream?$params&url=" . urlencode($channelUrl);
+    }
+    
+    public function endSession($sessionToken) {
+        try {
+            // Get session info
+            $stmt = $this->db->prepare(
+                "SELECT server_id, user_id, channel_id, started_at 
+                 FROM active_sessions WHERE session_token = ?"
+            );
+            $stmt->execute([$sessionToken]);
+            $session = $stmt->fetch();
+            
+            if ($session) {
+                // Update statistics
+                $duration = time() - strtotime($session['started_at']);
+                $this->db->prepare(
+                    "UPDATE stream_stats 
+                     SET duration_seconds = ?, ended_at = NOW() 
+                     WHERE user_id = ? AND channel_id = ? AND ended_at IS NULL"
+                )->execute([$duration, $session['user_id'], $session['channel_id']]);
+                
+                // Delete session
+                $this->db->prepare(
+                    "DELETE FROM active_sessions WHERE session_token = ?"
+                )->execute([$sessionToken]);
+                
+                // Update server load
+                $this->db->prepare(
+                    "UPDATE servers SET current_load = GREATEST(current_load - 1, 0) 
+                     WHERE id = ?"
+                )->execute([$session['server_id']]);
+            }
+            
+            return ['success' => true];
+            
+        } catch (Exception $e) {
+            error_log("End session error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Failed to end session'];
+        }
+    }
+}
